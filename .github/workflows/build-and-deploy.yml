@@ -1,0 +1,176 @@
+# ============================================================
+# Minecraft Server - CI/CD Build & Deploy Pipeline
+# ============================================================
+# This workflow automates the full lifecycle of the Minecraft
+# Docker server:
+#   1. BUILD   — Multi-stage Docker build (downloads latest jar)
+#   2. TEST    — Smoke test: verify the container starts
+#   3. PUBLISH — Push image to GitHub Container Registry (GHCR)
+#   4. DEPLOY  — Pull from GHCR onto a separate runner and
+#                start the server, proving full delivery
+#
+# Trigger: Push to 'main' branch or manual dispatch.
+# ============================================================
+
+name: Minecraft Server - Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: minecraft-server
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build & Publish Docker Image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      tag_latest: ${{ steps.meta.outputs.tag_latest }}
+      tag_sha: ${{ steps.meta.outputs.tag_sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image tags (latest + commit SHA)
+        id: meta
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+          TAG=$(echo "$TAG" | tr '[:upper:]' '[:lower:]')
+          echo "tag_latest=${TAG}:latest" >> "$GITHUB_OUTPUT"
+          echo "tag_sha=${TAG}:$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image (multi-stage)
+        run: |
+          docker build \
+            -t ${{ steps.meta.outputs.tag_latest }} \
+            -t ${{ steps.meta.outputs.tag_sha }} \
+            -f Dockerfile.builder .
+
+      - name: Smoke test — verify container starts
+        run: |
+          echo "=== Starting container for smoke test ==="
+          CONTAINER_ID=$(docker run -d ${{ steps.meta.outputs.tag_latest }})
+          sleep 15
+          STATUS=$(docker inspect --format='{{.State.Running}}' "$CONTAINER_ID" 2>/dev/null || echo "false")
+          echo "=== Container logs ==="
+          docker logs "$CONTAINER_ID" 2>&1 | tail -30
+          docker stop "$CONTAINER_ID" > /dev/null
+          if [ "$STATUS" != "true" ]; then
+            echo "::error::Container exited within 15s — build is broken."
+            exit 1
+          fi
+          echo "Smoke test PASSED."
+
+      - name: Push image to GHCR
+        run: |
+          docker push ${{ steps.meta.outputs.tag_latest }}
+          docker push ${{ steps.meta.outputs.tag_sha }}
+
+      - name: Build summary
+        run: |
+          echo "### Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image (latest) | \`${{ steps.meta.outputs.tag_latest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image (SHA) | \`${{ steps.meta.outputs.tag_sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Smoke Test | Passed |" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to Cloud Runner
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up server directories
+        run: |
+          echo "=== Preparing deploy target ==="
+          sudo mkdir -p /opt/minecraft/world
+          cat <<'PROPS' | sudo tee /opt/minecraft/server.properties
+          server-port=25565
+          gamemode=survival
+          difficulty=normal
+          max-players=20
+          view-distance=10
+          motd=Deployed via GitHub Actions CI/CD Pipeline
+          enable-command-block=true
+          PROPS
+          echo '[]' | sudo tee /opt/minecraft/ops.json
+          echo '[]' | sudo tee /opt/minecraft/whitelist.json
+
+      - name: Pull image from GHCR
+        run: |
+          echo "=== Pulling image from registry ==="
+          docker pull ${{ needs.build.outputs.tag_latest }}
+          echo "Pull successful."
+
+      - name: Deploy — start Minecraft server
+        run: |
+          echo "=== Starting Minecraft server container ==="
+          docker run -d \
+            --name minecraft-server \
+            -v /opt/minecraft/world:/minecraft/world \
+            -v /opt/minecraft/server.properties:/minecraft/server.properties \
+            -v /opt/minecraft/ops.json:/minecraft/ops.json \
+            -v /opt/minecraft/whitelist.json:/minecraft/whitelist.json \
+            -p 25565:25565 \
+            ${{ needs.build.outputs.tag_latest }}
+
+      - name: Verify deployment
+        run: |
+          echo "=== Waiting for server startup ==="
+          sleep 20
+          echo "=== Container status ==="
+          docker ps --filter name=minecraft-server \
+            --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+          STATUS=$(docker inspect --format='{{.State.Running}}' minecraft-server)
+          if [ "$STATUS" != "true" ]; then
+            echo "::error::Deploy FAILED — container not running."
+            docker logs minecraft-server 2>&1 | tail -30
+            exit 1
+          fi
+          echo ""
+          echo "=== Server logs ==="
+          docker logs minecraft-server 2>&1 | tail -30
+          echo ""
+          echo "========================================="
+          echo "  DEPLOY SUCCESSFUL"
+          echo "  Image: ${{ needs.build.outputs.tag_latest }}"
+          echo "  Port:  25565"
+          echo "========================================="
+
+      - name: Deploy summary
+        run: |
+          echo "### Deploy Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Status | Deployed successfully |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | \`${{ needs.build.outputs.tag_latest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Port | 25565 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The image was built and published to GHCR, then **pulled onto a separate cloud runner** and started successfully." >> "$GITHUB_STEP_SUMMARY"

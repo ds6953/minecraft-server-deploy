@@ -24,7 +24,7 @@ WORKDIR /minecraft
 COPY --from=builder /minecraft/server.jar /minecraft/server.jar
 
 # Mark the EULA as agreed to
-RUN rm eula.txt
+RUN rm -f eula.txt
 RUN echo "eula=true" > eula.txt
 
 # Run the Minecraft server on container start
